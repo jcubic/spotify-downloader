@@ -90,6 +90,12 @@ class DownloaderOptions(TypedDict):
     create_skip_file: Optional[bool]
     respect_skip_file: Optional[bool]
     sync_remove_lrc: Optional[bool]
+    resume: Optional[bool]
+    state_dir: Optional[str]
+    no_state: Optional[bool]
+    reset_state: Optional[bool]
+    retry_failed: Optional[bool]
+    state_info: Optional[bool]
 
 
 class WebOptions(TypedDict):
@@ -184,6 +190,12 @@ class DownloaderOptionalOptions(TypedDict, total=False):
     create_skip_file: Optional[bool]
     respect_skip_file: Optional[bool]
     sync_remove_lrc: Optional[bool]
+    resume: Optional[bool]
+    state_dir: Optional[str]
+    no_state: Optional[bool]
+    reset_state: Optional[bool]
+    retry_failed: Optional[bool]
+    state_info: Optional[bool]
 
 
 class WebOptionalOptions(TypedDict, total=False):

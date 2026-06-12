@@ -637,6 +637,48 @@ def parse_output_options(parser: _ArgumentGroup):
         help="Remove lrc files when using sync operation when downloading songs",
     )
 
+    # State management options
+    parser.add_argument(
+        "--resume",
+        action="store_const",
+        const=True,
+        help="Resume a previous playlist/album download using saved state",
+    )
+
+    parser.add_argument(
+        "--state-dir",
+        type=str,
+        help="Custom state directory (default: ./.spotdl)",
+    )
+
+    parser.add_argument(
+        "--no-state",
+        action="store_const",
+        const=True,
+        help="Disable state tracking for this download",
+    )
+
+    parser.add_argument(
+        "--reset-state",
+        action="store_const",
+        const=True,
+        help="Clear state and re-download everything",
+    )
+
+    parser.add_argument(
+        "--retry-failed",
+        action="store_const",
+        const=True,
+        help="Retry only failed songs from previous run",
+    )
+
+    parser.add_argument(
+        "--state-info",
+        action="store_const",
+        const=True,
+        help="Show download state info without downloading",
+    )
+
 
 def parse_web_options(parser: _ArgumentGroup):
     """

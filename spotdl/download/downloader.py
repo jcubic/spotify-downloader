@@ -44,6 +44,8 @@ from spotdl.utils.lrc import generate_lrc
 from spotdl.utils.m3u import gen_m3u_files
 from spotdl.utils.metadata import MetadataError, embed_metadata
 from spotdl.utils.search import gather_known_songs, reinit_song, songs_from_albums
+from spotdl.utils.state import SongStatus, get_iso_timestamp
+from spotdl.utils.state_manager import StateManager
 
 __all__ = [
     "AUDIO_PROVIDERS",
@@ -236,6 +238,18 @@ class Downloader:
 
         logger.debug("Archive: %d urls", len(self.url_archive))
 
+        # Initialize state manager
+        self.state_manager: Optional[StateManager] = None
+        if not self.settings.get("no_state", False):
+            state_dir_path: Optional[Path] = None
+            state_dir_setting = self.settings.get("state_dir")
+            if state_dir_setting and isinstance(state_dir_setting, str):
+                state_dir_path = Path(state_dir_setting)
+            self.state_manager = StateManager(state_dir_path)
+            logger.debug(
+                "State manager initialized with dir: %s", self.state_manager.state_dir
+            )
+
         logger.debug("Downloader initialized")
 
     def download_song(self, song: Song) -> Tuple[Song, Optional[Path]]:
@@ -255,6 +269,93 @@ class Downloader:
 
         return results[0]
 
+    def _get_list_info_from_songs(
+        self, songs: List[Song]
+    ) -> Optional[Tuple[str, str, str, str]]:
+        """
+        Extract list information from songs if they belong to a playlist/album.
+
+        ### Arguments
+        - songs: List of songs to check
+
+        ### Returns
+        - Tuple of (list_type, list_id, list_url, list_name) or None if not a list
+        """
+        if not songs:
+            return None
+
+        # Check if songs have list metadata
+        first_song = songs[0]
+        if first_song.list_url and first_song.list_name:
+            # Extract list info from URL
+            list_info = StateManager.extract_list_info(first_song.list_url)
+            if list_info:
+                list_type, list_id = list_info
+                return list_type, list_id, first_song.list_url, first_song.list_name
+
+        return None
+
+    def _filter_songs_by_state(
+        self, songs: List[Song], list_type: str, list_id: str
+    ) -> List[Song]:
+        """
+        Filter songs based on their state.
+
+        ### Arguments
+        - songs: List of songs to filter
+        - list_type: Type of list (playlist/album)
+        - list_id: ID of the list
+
+        ### Returns
+        - Filtered list of songs
+        """
+        if not self.state_manager:
+            return songs
+
+        # Load existing song states
+        song_states = self.state_manager.load_all_song_states(list_type, list_id)
+
+        # Filter based on mode
+        if self.settings.get("retry_failed"):
+            # Only retry failed songs
+            failed_ids = [
+                state.id
+                for state in song_states.values()
+                if state.status == SongStatus.FAILED
+            ]
+            filtered = [song for song in songs if song.song_id in failed_ids]
+            logger.info("Retrying %d failed songs", len(filtered))
+            return filtered
+        elif self.settings.get("resume"):
+            # Skip completed and skipped songs
+            completed_or_skipped_ids = {
+                state.id
+                for state in song_states.values()
+                if state.status in (SongStatus.COMPLETED, SongStatus.SKIPPED)
+            }
+            filtered = [
+                song for song in songs if song.song_id not in completed_or_skipped_ids
+            ]
+            completed_count = sum(
+                1
+                for state in song_states.values()
+                if state.status == SongStatus.COMPLETED
+            )
+            skipped_count = sum(
+                1
+                for state in song_states.values()
+                if state.status == SongStatus.SKIPPED
+            )
+            logger.info(
+                "Resuming download: %d songs remaining, %d already completed, %d already skipped",
+                len(filtered),
+                completed_count,
+                skipped_count,
+            )
+            return filtered
+
+        return songs
+
     def download_multiple_songs(
         self, songs: List[Song]
     ) -> List[Tuple[Song, Optional[Path]]]:
@@ -267,6 +368,32 @@ class Downloader:
         ### Returns
         - list of tuples with the song and the path to the downloaded file if successful.
         """
+
+        # Initialize state tracking if applicable
+        list_info = None
+        if self.state_manager and songs:
+            list_info = self._get_list_info_from_songs(songs)
+            if list_info:
+                list_type, list_id, list_url, list_name = list_info
+
+                # Check if user wants to reset state
+                if self.settings.get("reset_state"):
+                    logger.info("Resetting state for %s", list_name)
+                    self.state_manager.cleanup_state(list_type, list_id)
+
+                # Initialize state from songs
+                self.state_manager.initialize_from_songs(
+                    songs,
+                    list_type,
+                    list_id,
+                    list_url,
+                    list_name,
+                    str(Path(self.settings["output"]).parent),
+                    dict(self.settings),
+                )
+
+                # Filter songs based on state
+                songs = self._filter_songs_by_state(songs, list_type, list_id)
 
         if self.settings["fetch_albums"]:
             albums = set(song.album_id for song in songs if song.album_id is not None)
@@ -296,6 +423,23 @@ class Downloader:
 
         # Call all task asynchronously, and wait until all are finished
         results = list(self.loop.run_until_complete(asyncio.gather(*tasks)))
+
+        # Update playlist state if tracking
+        if self.state_manager and list_info:
+            list_type, list_id, _, _ = list_info
+            playlist_state = self.state_manager.load_playlist_state(list_type, list_id)
+            if playlist_state:
+                all_states = self.state_manager.load_all_song_states(list_type, list_id)
+                playlist_state.update_counts(list(all_states.values()))
+                playlist_state.last_download = get_iso_timestamp()
+                self.state_manager.save_playlist_state(playlist_state)
+
+                logger.info(
+                    "State: %d completed, %d failed, %d pending",
+                    playlist_state.downloaded,
+                    playlist_state.failed,
+                    playlist_state.pending,
+                )
 
         # Print errors
         if self.settings["print_errors"]:
@@ -422,6 +566,57 @@ class Downloader:
 
         return None
 
+    def _update_song_state(
+        self,
+        song: Song,
+        status: SongStatus,
+        output_path: Optional[Path] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        """
+        Update song state if state manager is enabled.
+
+        ### Arguments
+        - song: The song to update
+        - status: New status
+        - output_path: Path to downloaded file
+        - error: Error message if failed
+        """
+        if not self.state_manager or not song.list_url:
+            return
+
+        list_info = StateManager.extract_list_info(song.list_url)
+        if not list_info:
+            return
+
+        list_type, list_id = list_info
+
+        # Check if state exists for this song
+        song_state = self.state_manager.load_song_state(
+            list_type, list_id, song.song_id
+        )
+        if not song_state:
+            return
+
+        # Update state
+        update_kwargs: Dict[str, any] = {}  # type: ignore
+        if output_path:
+            # Store relative path
+            output_dir = Path(self.settings["output"]).parent
+            try:
+                rel_path = output_path.relative_to(output_dir)
+                update_kwargs["output_path"] = str(rel_path)
+            except ValueError:
+                update_kwargs["output_path"] = str(output_path)
+
+        if error:
+            update_kwargs["error"] = error
+            update_kwargs["attempts"] = song_state.attempts + 1
+
+        self.state_manager.update_song_status(
+            list_type, list_id, song.song_id, status, **update_kwargs
+        )
+
     def search_and_download(  # pylint: disable=R0911
         self, song: Song
     ) -> Tuple[Song, Optional[Path]]:
@@ -444,6 +639,9 @@ class Downloader:
         ):
             logger.error("Song is missing required fields: %s", song.display_name)
             self.errors.append(f"Song is missing required fields: {song.display_name}")
+            self._update_song_state(
+                song, SongStatus.FAILED, error="Missing required fields"
+            )
             return song, None
 
         # Reinitialize the song object if it's missing metadata
@@ -481,7 +679,54 @@ class Downloader:
 
         if song.explicit is True and self.settings["skip_explicit"] is True:
             logger.info("Skipping explicit song: %s", song.display_name)
+            self._update_song_state(song, SongStatus.SKIPPED)
             return song, None
+
+        # Early check for existing files to avoid unnecessary processing and API calls
+        # Check if there is an already existing song file, with the same spotify URL in its
+        # metadata, but saved under a different name. If so, save its path.
+        dup_song_paths_early: List[Path] = self.known_songs.get(song.url, [])
+
+        # Remove files from the list that have the same path as the output file
+        dup_song_paths_early = [
+            dup_song_path
+            for dup_song_path in dup_song_paths_early
+            if (dup_song_path.absolute() != output_file.absolute())
+            and dup_song_path.exists()
+        ]
+
+        # Check if file already exists
+        file_exists_early = output_file.exists() or dup_song_paths_early
+        if not self.settings["scan_for_songs"]:
+            for file_extension in self.scan_formats:
+                ext_path = output_file.with_suffix(f".{file_extension}")
+                if ext_path.exists():
+                    file_exists_early = True
+                    break
+
+        # If file exists and we should skip, return early without any YouTube/provider requests
+        if (
+            Path(str(output_file.absolute()) + ".skip").exists()
+            and self.settings["respect_skip_file"]
+        ):
+            logger.info(
+                "Skipping %s (skip file found)",
+                song.display_name,
+            )
+            self._update_song_state(song, SongStatus.SKIPPED, output_path=output_file)
+            return song, output_file if output_file.exists() else None
+
+        if file_exists_early and self.settings["overwrite"] == "skip":
+            logger.info(
+                "Skipping %s (file already exists) %s",
+                song.display_name,
+                "(duplicate)" if dup_song_paths_early else "",
+            )
+            self._update_song_state(song, SongStatus.SKIPPED, output_path=output_file)
+            return song, output_file
+
+        # Update state to downloading (only if we're actually going to download)
+        self._update_song_state(song, SongStatus.DOWNLOADING)
 
         # Initialize the progress tracker
         display_progress_tracker = self.progress_handler.get_new_tracker(song)
@@ -490,8 +735,7 @@ class Downloader:
             # Create the temp folder path
             temp_folder = get_temp_path()
 
-            # Check if there is an already existing song file, with the same spotify URL in its
-            # metadata, but saved under a different name. If so, save its path.
+            # Re-check for duplicate song paths (needed for overwrite modes)
             dup_song_paths: List[Path] = self.known_songs.get(song.url, [])
 
             # Remove files from the list that have the same path as the output file
@@ -509,6 +753,7 @@ class Downloader:
                     ext_path = output_file.with_suffix(f".{file_extension}")
                     if ext_path.exists():
                         dup_song_paths.append(ext_path)
+                        file_exists = True
 
             if dup_song_paths:
                 logger.debug(
@@ -519,31 +764,8 @@ class Downloader:
                     ),
                 )
 
-            # If the file already exists and we don't want to overwrite it,
-            # we can skip the download
-            if (  # pylint: disable=R1705
-                Path(str(output_file.absolute()) + ".skip").exists()
-                and self.settings["respect_skip_file"]
-            ):
-                logger.info(
-                    "Skipping %s (skip file found) %s",
-                    song.display_name,
-                    "",
-                )
-
-                return song, output_file if output_file.exists() else None
-
-            elif file_exists and self.settings["overwrite"] == "skip":
-                logger.info(
-                    "Skipping %s (file already exists) %s",
-                    song.display_name,
-                    "(duplicate)" if dup_song_paths else "",
-                )
-
-                display_progress_tracker.notify_download_skip()
-                return song, output_file
-
-            # Don't skip if the file exists and overwrite is set to force
+            # Handle overwrite modes for existing files
+            # Note: Skip mode was already handled earlier
             if file_exists and self.settings["overwrite"] == "force":
                 logger.info(
                     "Overwriting %s %s",
@@ -588,8 +810,10 @@ class Downloader:
                     # Get the most recent duplicate song path and remove the rest
                     most_recent_duplicate = max(
                         dup_song_paths,
-                        key=lambda dup_song_path: dup_song_path.stat().st_mtime
-                        and dup_song_path.suffix == output_file.suffix,
+                        key=lambda dup_song_path: (
+                            dup_song_path.stat().st_mtime
+                            and dup_song_path.suffix == output_file.suffix
+                        ),
                     )
 
                     # Remove the rest of the duplicate song paths
@@ -626,6 +850,9 @@ class Downloader:
                     )
 
                     display_progress_tracker.notify_complete()
+                    self._update_song_state(
+                        song, SongStatus.FAILED, error="Different file extension"
+                    )
 
                     return song, None
 
@@ -644,6 +871,9 @@ class Downloader:
                 )
 
                 display_progress_tracker.notify_complete()
+                self._update_song_state(
+                    song, SongStatus.COMPLETED, output_path=output_file
+                )
 
                 return song, output_file
 
@@ -850,6 +1080,9 @@ class Downloader:
 
             logger.info('Downloaded "%s": %s', song.display_name, song.download_url)
 
+            # Update state to completed
+            self._update_song_state(song, SongStatus.COMPLETED, output_path=output_file)
+
             return song, output_file
         except (Exception, UnicodeEncodeError) as exception:
             if isinstance(exception, UnicodeEncodeError):
@@ -866,4 +1099,12 @@ class Downloader:
             self.errors.append(
                 f"{song.url} - {exception.__class__.__name__}: {exception}"
             )
+
+            # Update state to failed
+            self._update_song_state(
+                song,
+                SongStatus.FAILED,
+                error=f"{exception.__class__.__name__}: {exception}",
+            )
+
             return song, None

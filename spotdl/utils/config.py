@@ -368,6 +368,12 @@ DOWNLOADER_OPTIONS: DownloaderOptions = {
     "create_skip_file": False,
     "respect_skip_file": False,
     "sync_remove_lrc": False,
+    "resume": False,
+    "state_dir": None,
+    "no_state": False,
+    "reset_state": False,
+    "retry_failed": False,
+    "state_info": False,
 }
 
 WEB_OPTIONS: WebOptions = {
